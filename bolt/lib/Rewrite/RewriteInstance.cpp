@@ -2693,8 +2693,14 @@ void RewriteInstance::adjustCommandLineOptions() {
   BC->UseCompactAligner = opts::UseCompactAligner;
   BC->X86AlignBranchBoundaryHotOnly = opts::X86AlignBranchBoundaryHotOnly;
 
+  if (opts::Rewrite && opts::Lite) {
+    BC->errs() << "BOLT-WARNING: -rewrite overrides -lite "
+                  "(all functions must be emitted in -rewrite mode)\n";
+    opts::Lite = false;
+  }
+
   if (BC->isX86() && opts::Lite.getNumOccurrences() == 0 && !opts::StrictMode &&
-      !opts::UseOldText)
+      !opts::UseOldText && !opts::Rewrite)
     opts::Lite = true;
 
   if (opts::Lite && opts::UseOldText) {
