@@ -2158,8 +2158,14 @@ void RewriteInstance::disassemblePLTSectionX86(BinarySection &Section,
         }
       }
       if (PushedIndex) {
+        // The 3 reserved GOT entries + the lazy JUMP_SLOT slots live in
+        // .got.plt for linkers that emit a separate PLT GOT (e.g. lld), but
+        // bfd merges them into a single .got section (partial RELRO). Fall
+        // back to .got when there is no dedicated .got.plt.
         ErrorOr<BinarySection &> GotPlt =
             BC->getUniqueSectionByName(".got.plt");
+        if (!GotPlt)
+          GotPlt = BC->getUniqueSectionByName(".got");
         if (GotPlt) {
           const uint64_t Slot = GotPlt->getAddress() + 3 * 8 + 8 * *PushedIndex;
           if (BC->getDynamicRelocationAt(Slot))
@@ -4555,11 +4561,16 @@ void RewriteInstance::mapLoadableSegmentsRewrite(
         continue;
       if (MappedSections.count(&Section))
         continue;
-      // Skip BOLT-internal sections (renamed originals with OrgSecPrefix).
+      // Skip BOLT-internal sections (renamed originals with OrgSecPrefix)
+      // that are fully replaced by regenerated output: the original code
+      // section and .eh_frame. Other renamed originals (e.g. .rodata, which
+      // only receives new jump tables while its original contents, such as
+      // string literals, are not re-emitted) must be kept in the output.
       // Use getOutputName() because ExecutableFileMemoryManager renames
       // originals via setOutputName(), which changes OutputName but not
       // the internal Name.
-      if (Section.getOutputName().starts_with(getOrgSecPrefix()))
+      if (Section.getOutputName().starts_with(getOrgSecPrefix()) &&
+          (Section.isText() || Section.getName() == getEHFrameSectionName()))
         continue;
       // Determine if this is an original section (has an input address) or
       // a new BOLT-created section. Original sections are matched to this
@@ -5854,9 +5865,12 @@ RewriteInstance::getOutputSections(ELFObjectFile<ELFT> *File,
       continue;
 
     // In -rewrite mode, exclude BOLT-internal sections (renamed originals
-    // with OrgSecPrefix) from the section header table. Use getOutputName()
+    // with OrgSecPrefix) that are fully replaced by regenerated output from
+    // the section header table. Renamed originals still holding original
+    // content (e.g. .rodata strings) keep their header. Use getOutputName()
     // because setOutputName() only changes the output name.
-    if (opts::Rewrite && BinSec->getOutputName().starts_with(getOrgSecPrefix()))
+    if (opts::Rewrite && BinSec->getOutputName().starts_with(getOrgSecPrefix()) &&
+        (BinSec->isText() || BinSec->getName() == getEHFrameSectionName()))
       continue;
 
     addSection(Section, *BinSec);
@@ -7627,13 +7641,16 @@ void RewriteInstance::rewriteFile() {
       continue;
     }
 
-    // In -rewrite mode, skip all BOLT-internal sections (renamed originals
-    // with OrgSecPrefix and new sections with NewSecPrefix). Original text
-    // is replaced by emitFunctions(); original data sections are emitted
-    // via emitDataSections under clean names. Use getOutputName() because
-    // setOutputName() only changes OutputName, not the internal Name.
+    // In -rewrite mode, skip BOLT-internal sections that are fully replaced
+    // by regenerated output (renamed originals .bolt.org.text/.eh_frame and
+    // any leftover new sections with NewSecPrefix). Renamed originals that
+    // still hold original content (e.g. .bolt.org.rodata — its string
+    // literals are not re-emitted) are written below like other data
+    // sections. Use getOutputName() because setOutputName() only changes
+    // OutputName, not the internal Name.
     if (opts::Rewrite &&
-        (Section.getOutputName().starts_with(getOrgSecPrefix()) ||
+        ((Section.getOutputName().starts_with(getOrgSecPrefix()) &&
+          (Section.isText() || Section.getName() == getEHFrameSectionName())) ||
          Section.getOutputName().starts_with(getNewSecPrefix()))) {
       LLVM_DEBUG(dbgs() << "BOLT-DEBUG: skipping BOLT-internal section "
                         << Section.getOutputName() << " in rewrite mode\n");
