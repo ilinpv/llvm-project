@@ -2674,6 +2674,13 @@ void RewriteInstance::adjustCommandLineOptions() {
       errs() << "BOLT-ERROR: -rewrite is incompatible with -instrument\n";
       exit(1);
     }
+    if (!opts::SkipFunctionNames.empty() ||
+        !opts::SkipFunctionNamesFile.empty()) {
+      errs() << "BOLT-ERROR: -rewrite is incompatible with -skip-funcs/"
+                "-skip-funcs-file: skipped functions cannot be relocated in "
+                "-rewrite mode\n";
+      exit(1);
+    }
     if (!BC->isAArch64() && !BC->isX86()) {
       errs() << "BOLT-ERROR: -rewrite is only supported on AArch64 and X86\n";
       exit(1);
