@@ -16,6 +16,15 @@ using namespace llvm;
 namespace llvm {
 namespace bolt {
 
+// Synthetic placeholder symbols created while reading relocations. Ordinary
+// GOT slots use __BOLT_got_zero; descriptor-based TLS accesses use a distinct
+// marker so they can be routed to the TLSDESC handling below instead of the
+// .got-only fallback sweep.
+static bool isBOLTZeroSymbol(const MCSymbol *S) {
+  return S && (S->getName() == "__BOLT_got_zero" ||
+               S->getName() == "__BOLT_tlsdesc_zero");
+}
+
 // This pass handles ADRP-based GOT references on AArch64 that were created
 // during disassembly. The AArch64MCSymbolizer creates placeholder references
 // to the synthetic symbol __BOLT_got_zero (registered at address 0) with an
@@ -81,7 +90,7 @@ void FixRelaxations::runOnFunction(BinaryFunction &BF) {
         continue;
 
       const MCSymbol *AdrpSymbol = BC.MIB->getTargetSymbol(Adrp);
-      if (!AdrpSymbol || AdrpSymbol->getName() != "__BOLT_got_zero")
+      if (!isBOLTZeroSymbol(AdrpSymbol))
         continue;
 
       // Search forward for the instruction paired with this ADRP.
@@ -105,19 +114,28 @@ void FixRelaxations::runOnFunction(BinaryFunction &BF) {
       // from the same page); each needs its own GOTENT so its low-12 bits
       // address its own slot in the output .got.
       SmallVector<MCInst *, 4> ReuseLoads;
+      // TLSDESC descriptor-address ADDs that reuse the same ADRP base
+      // register (the ADRP feeds both the resolver LDR and the ADD).
+      SmallVector<MCInst *, 4> ReuseAdds;
 
       // Return true when the search must stop (base register redefined).
       // The first ADD/LDR reading the base register is selected as the
       // paired instruction; later loads reading the base register with a
-      // __BOLT_got_zero operand are collected as reuse loads. Loads do not
+      // placeholder operand are collected as reuse loads. Loads do not
       // modify the base register, so the scan continues past them; an ADD
       // pair or any other writer of the base register terminates it.
       auto scanInst = [&](MCInst &Candidate) -> bool {
         if (BC.MIB->isNoop(Candidate))
           return false;
         if (BC.MIB->matchAdrpAddPair(Adrp, Candidate)) {
-          if (!Paired)
+          if (!Paired) {
             Paired = &Candidate;
+          } else if (const MCSymbol *S = BC.MIB->getTargetSymbol(Candidate, 2);
+                     S && S->getName() == "__BOLT_tlsdesc_zero") {
+            // TLSDESC: the ADD computes the descriptor address; pair it with
+            // the LDR so both retarget to the same GOTENT.
+            ReuseAdds.push_back(&Candidate);
+          }
           return true; // the ADD redefines the base register
         }
         if (BC.MIB->mayLoad(Candidate) && Candidate.getNumOperands() > 1 &&
@@ -126,7 +144,7 @@ void FixRelaxations::runOnFunction(BinaryFunction &BF) {
           if (!Paired) {
             Paired = &Candidate;
           } else if (const MCSymbol *S = BC.MIB->getTargetSymbol(Candidate, 2);
-                     S && S->getName() == "__BOLT_got_zero") {
+                     S && isBOLTZeroSymbol(S)) {
             ReuseLoads.push_back(&Candidate);
           }
         }
@@ -245,7 +263,7 @@ void FixRelaxations::runOnFunction(BinaryFunction &BF) {
         continue;
 
       const MCSymbol *LdrSymbol = BC.MIB->getTargetSymbol(Next, 2);
-      if (!LdrSymbol || LdrSymbol->getName() != "__BOLT_got_zero")
+      if (!isBOLTZeroSymbol(LdrSymbol))
         continue;
 
       const int64_t AdrpAddend = BC.MIB->getTargetAddend(Adrp);
@@ -280,6 +298,21 @@ void FixRelaxations::runOnFunction(BinaryFunction &BF) {
         BC.MIB->setOperandToSymbolRef(*Reuse, /*OpNum*/ 2, ReuseGOTENT,
                                       /*Addend*/ 0, BC.Ctx.get(),
                                       ELF::R_AARCH64_LDST64_ABS_LO12_NC);
+      }
+
+      // TLSDESC: the same ADRP feeds both the LDR (resolver load) and the ADD
+      // (descriptor address). Retarget the ADD to the same GOTENT so its
+      // low-12 bits match the relocated descriptor instead of the old slot.
+      for (MCInst *Add : ReuseAdds) {
+        const int64_t AddEntryAddr =
+            AdrpAddend + BC.MIB->getTargetAddend(*Add, 2);
+        if (!AddEntryAddr)
+          continue;
+        MCSymbol *AddGOTENT =
+            BC.getOrCreateGlobalSymbol(AddEntryAddr, "GOTENT");
+        BC.MIB->setOperandToSymbolRef(*Add, /*OpNum*/ 2, AddGOTENT,
+                                      /*Addend*/ 0, BC.Ctx.get(),
+                                      ELF::R_AARCH64_ADD_ABS_LO12_NC);
       }
     }
   }
@@ -406,7 +439,7 @@ Error FixRelaxations::runOnFunctions(BinaryContext &BC) {
       for (MCInst &Inst : BB) {
         for (unsigned OpIdx = 0; OpIdx < Inst.getNumOperands(); ++OpIdx) {
           const MCSymbol *Sym = BC.MIB->getTargetSymbol(Inst, OpIdx);
-          if (Sym && Sym->getName() == "__BOLT_got_zero") {
+          if (isBOLTZeroSymbol(Sym)) {
             ++NumLeftover;
             if (LeftoverFuncs.size() < 8)
               LeftoverFuncs.push_back(BF.getPrintName());
@@ -417,8 +450,8 @@ Error FixRelaxations::runOnFunctions(BinaryContext &BC) {
   }
   if (NumLeftover) {
     errs() << "BOLT-ERROR: " << NumLeftover
-           << " unretargetable __BOLT_got_zero reference(s) remain after "
-              "FixRelaxations (e.g. ";
+           << " unretargetable GOT/TLSDESC placeholder reference(s) remain "
+              "after FixRelaxations (e.g. ";
     for (const std::string &F : LeftoverFuncs)
       errs() << F << " ";
     errs() << "). The output binary would contain stale GOT offsets.\n";
