@@ -7342,8 +7342,19 @@ uint64_t RewriteInstance::getNewFunctionOrDataAddress(uint64_t OldAddress) {
   // whose offset must not be preserved.
   if (const BinaryFunction *BF =
           BC->getBinaryFunctionContainingAddress(OldAddress))
-    if (BF->getOutputAddress() && !BF->isPLTFunction())
+    if (BF->getOutputAddress() && !BF->isPLTFunction()) {
+      if (BF->isEmitted()) {
+        // The layout of an emitted function may have changed (e.g. by block
+        // reordering). Map interior addresses - such as label address
+        // entries of computed-goto tables in .rodata - through the
+        // function's address translation instead of preserving the old
+        // intra-function offset.
+        if (uint64_t NewAddress = BF->translateInputToOutputAddress(
+                OldAddress))
+          return NewAddress;
+      }
       return BF->getOutputAddress() + (OldAddress - BF->getAddress());
+    }
 
   const BinaryData *BD = BC->getBinaryDataAtAddress(OldAddress);
   if (BD && BD->isMoved())
