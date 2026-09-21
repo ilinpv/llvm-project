@@ -1,4 +1,4 @@
-# REQUIRES: system-linux
+# REQUIRES: system-linux, x86_64-host
 
 # This test checks that BOLT correctly processes computed-goto dispatch tables:
 # label address tables referenced through a table base pre-materialized into a
