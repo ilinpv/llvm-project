@@ -9,7 +9,7 @@
 ## start on a page boundary (offset 0), which the disassembler prints as
 ## `[xN]` without an immediate.
 
-# REQUIRES: system-linux
+# REQUIRES: system-linux, target=aarch64{{.*}}
 
 # RUN: llvm-mc -filetype=obj -triple aarch64-unknown-unknown %s -o %t.o
 # RUN: %clang %cflags %t.o -o %t.so -Wl,-q -fuse-ld=bfd -shared
